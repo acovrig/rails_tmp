@@ -1,0 +1,51 @@
+version: '2'
+services:
+  postgres:
+    image: postgres
+    container_name: postgres
+    restart: always
+    environment:
+      - POSTGRES_PASSWORD=db_password_here
+    volumes:
+      - ./postgres:/var/lib/postgresql
+
+  redis:
+    image: redis
+    restart: "no"
+
+  outreach:
+    image: reg.iiw.org/outreach/rails
+    build: .
+    container_name: outreach
+    restart: "no"
+    command: "./docker_start.sh"
+    user: "root"
+    environment:
+      - SMTP_HOST=smtp.sendgrid.net
+      - SMTP_PORT=465
+      - SMTP_USERNAME=apikey
+      - SMTP_PASSWORD=put_key_here
+      - RAILS_ENV=development
+      - DATABASE_USER=postgres
+      - DATABASE_PASSWORD=db_password_here
+      - WEBPACKER_DEV_SERVER_HOST=0.0.0.0
+      - WEBPACKER_DEV_SERVER_PUBLIC=domain_name_or_ip_of_server_here
+      - GOOGLE_CLIENT_ID=put_id_here
+      - GOOGLE_CLIENT_SECRET=put_secret_here
+    ports:
+      - 3000:3000/tcp
+    depends_on:
+      - postgres
+      - redis
+    volumes:
+      - ./:/app
+
+  rails_sidekiq:
+    image: reg.iiw.org/outreach/rails
+    restart: "no"
+    command: "./docker_start.sh sidekiq"
+    depends_on:
+      - postgres
+      - redis
+    volumes:
+      - .:/app
