@@ -1,0 +1,87 @@
+image: docker:stable
+
+stages:
+  - build
+  - test
+  - deploy
+
+variables:
+  CONTAINER_IMAGE: $CI_REGISTRY/$CI_PROJECT_PATH:$CI_COMMIT_SHA
+  ASSETS_IMAGE: $CI_REGISTRY/$CI_PROJECT_PATH/assets:$CI_COMMIT_SHA
+  DOCKER_DRIVER: overlay2
+  POSTGRES_DATABASE: test
+  POSTGRES_USER: root
+  POSTGRES_PASSWORD: asdf
+  RAILS_ENV: test
+  ASSETS_NAME: outreach_assets
+  SERVICE_NAME: outreach_api
+  WORKER_NAME: outreach_sq
+
+before_script:
+  - docker info
+  - 'which ssh-agent || apk add openssh-client'
+  - eval $(ssh-agent -s)
+  - echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add - > /dev/null
+  - mkdir ~/.ssh
+  - ssh-keyscan $PROD_IP >~/.ssh/known_hosts
+  # - ssh-keyscan $DEV_IP >>~/.ssh/known_hosts
+
+docker_build:
+  stage: build
+  script:
+    - docker build -t $CONTAINER_IMAGE .
+    - docker login -u gitlab-ci-token -p $CI_JOB_TOKEN $CI_REGISTRY
+    - docker push $CONTAINER_IMAGE
+    - docker tag $CONTAINER_IMAGE $CI_REGISTRY/$CI_PROJECT_PATH:latest
+    - docker push $CI_REGISTRY/$CI_PROJECT_PATH:latest
+
+    - docker create --name=tmp_$ASSETS_NAME $CONTAINER_IMAGE
+    - docker cp tmp_$ASSETS_NAME:/app/public pub
+    - docker rm -vf tmp_$ASSETS_NAME
+
+    - docker build -f Dockerfile-assets -t $ASSETS_IMAGE .
+    - docker push $ASSETS_IMAGE
+    - docker tag $ASSETS_IMAGE $CI_REGISTRY/$CI_PROJECT_PATH/assets:latest
+    - docker push $CI_REGISTRY/$CI_PROJECT_PATH/assets:latest
+
+test:
+  stage: test
+  script:
+    - docker ps -af "name=runner_$(echo "$CI_PROJECT_PATH"|sed 's/\//-/g')" -q | xargs -r docker rm -vf
+    - >
+      if [ "$(docker ps -af "name=postgres_$(echo "$CI_PROJECT_PATH"|sed 's/\//-/g')" -q)" = "" ]; then
+        docker run -itd --name "postgres_$(echo "$CI_PROJECT_PATH"|sed 's/\//-/g')" -e POSTGRES_USER=$POSTGRES_USER -e POSTGRES_PASSWORD=$POSTGRES_PASSWORD postgres:12.0;
+        while [ "$(docker logs "postgres_$(echo "$CI_PROJECT_PATH"|sed 's/\//-/g')" | egrep 'database system is ready to accept connections')" == "" ]; do sleep 1; done;
+        sleep 5;
+      fi
+    - docker logs --tail=10 "postgres_$(echo "$CI_PROJECT_PATH"|sed 's/\//-/g')"  | tail
+    - docker run -i --name runner_$(echo "$CI_PROJECT_PATH"|sed 's/\//-/g') --link "postgres_$(echo "$CI_PROJECT_PATH"|sed 's/\//-/g')":postgres -e POSTGRES_PASSWORD=$POSTGRES_PASSWORD -e RAILS_ENV=$RAILS_ENV -e OUTREACH_TOKEN=$OUTREACH_TOKEN $CONTAINER_IMAGE bash -c "rake db:create db:migrate db:seed; rails docs:generate; rubocop -S"
+    - docker commit -a "Gitlab CI" -m "Docs Generation" runner_$(echo "$CI_PROJECT_PATH"|sed 's/\//-/g') $CONTAINER_IMAGE
+    - docker rm -vf runner_$(echo "$CI_PROJECT_PATH"|sed 's/\//-/g')
+    - docker ps -af "name=postgres_$(echo "$CI_PROJECT_PATH"|sed 's/\//-/g')" -q | xargs -r docker rm -vf
+
+# stage:
+#   stage: deploy
+#   script:
+#     - docker login -u gitlab-ci-token -p $CI_JOB_TOKEN $CI_REGISTRY
+#     - docker push $CONTAINER_IMAGE
+#     - docker tag $CONTAINER_IMAGE $CI_REGISTRY/$CI_PROJECT_PATH:dev
+#     - docker push $CI_REGISTRY/$CI_PROJECT_PATH:dev
+#     - ssh $DEV_USER@$DEV_IP "docker-compose -f /srv/docker/docker-compose.yml pull outreach; docker-compose -f /srv/docker/docker-compose.yml up -d nginx"
+#   only:
+#     - dev
+
+
+deploy:
+  stage: deploy
+  script:
+    - echo "Deploying $ASSETS_IMAGE to $ASSETS_NAME"
+    - ssh $PROD_USER@$PROD_IP "docker service update --force --image $ASSETS_IMAGE --with-registry-auth $ASSETS_NAME"
+    - echo "Deploying $CONTAINER_IMAGE to $SERVICE_NAME"
+    - ssh $PROD_USER@$PROD_IP "docker service update --force --image $CONTAINER_IMAGE --with-registry-auth $SERVICE_NAME"
+    - echo "Deploying $CONTAINER_IMAGE to $WORKER_NAME"
+    - ssh $PROD_USER@$PROD_IP "docker service update --force --image $CONTAINER_IMAGE --with-registry-auth $WORKER_NAME"
+    - echo "Deploying $CONTAINER_IMAGE to $SMS_WORKER_NAME"
+    - ssh $PROD_USER@$PROD_IP "docker service update --force --image $CONTAINER_IMAGE --with-registry-auth $SMS_WORKER_NAME"
+  only:
+    - main
